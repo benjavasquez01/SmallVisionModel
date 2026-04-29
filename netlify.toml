@@ -5,9 +5,11 @@
 [[headers]]
   for = "/*"
   [headers.values]
-    # Enable CORS for WebGPU and model loading
+    # Required for SharedArrayBuffer (multi-threaded WASM)
     Cross-Origin-Embedder-Policy = "require-corp"
     Cross-Origin-Opener-Policy = "same-origin"
+    # wasm-unsafe-eval allows WebAssembly compilation without permitting arbitrary JS eval
+    Content-Security-Policy = "script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net; object-src 'none';"
     # Security headers
     X-Frame-Options = "DENY"
     X-Content-Type-Options = "nosniff"
