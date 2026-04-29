@@ -142,7 +142,8 @@ async function initModel() {
     // Set up IndexedDB-backed fetch BEFORE any from_pretrained() calls
     setupFetchOverride();
 
-    // WASM backend config — proxy must be false since we're already in a worker
+    env.backends.onnx.wasm.wasmPaths = '/';
+    env.backends.onnx.wasm.numThreads = 1;
     env.backends.onnx.wasm.proxy = false;
     env.useFSCache = false;
 
@@ -183,7 +184,7 @@ async function analyzeFrame({ imageBuffer, width, height, mode }) {
     const text = processor.apply_chat_template(messages, { add_generation_prompt: true });
     const inputs = await processor(text, [image], { do_image_splitting: false });
 
-    const generated = await model.generate({ ...inputs, max_new_tokens: 40 });
+    const generated = await model.generate({ ...inputs, max_new_tokens: 20 });
 
     const output = processor.batch_decode(
       generated.slice(null, [inputs.input_ids.dims.at(-1), null]),

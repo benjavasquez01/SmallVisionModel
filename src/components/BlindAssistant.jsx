@@ -1,125 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
-// ── ORT blob MIME-type fix ────────────────────────────────────────────────────
-// onnxruntime-web 1.22.0-dev creates Blob objects without a MIME type, then calls
-// import(URL.createObjectURL(blob)) with /*webpackIgnore:true*/, bypassing webpack.
-// Browsers reject import() of a blob typed as text/plain (the default).
-// We patch createObjectURL once, at module load time, to ensure any typeless blob
-// is re-wrapped as application/javascript before a URL is minted.
-;(function patchCreateObjectURL() {
-  const _orig = URL.createObjectURL.bind(URL);
-  URL.createObjectURL = function (obj) {
-    if (obj instanceof Blob && !obj.type) {
-      return _orig(new Blob([obj], { type: 'application/javascript' }));
-    }
-    return _orig(obj);
-  };
-})();
-
-// ── IndexedDB helpers ─────────────────────────────────────────────────────────
-const DB_NAME = 'smolvlm-cache-v1';
-const DB_STORE = 'files';
-const HF_DOMAINS = ['huggingface.co', 'hf.co', 'cdn-lfs'];
-
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function dbGet(key) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readonly');
-    const req = tx.objectStore(DB_STORE).get(key);
-    req.onsuccess = () => resolve(req.result ?? null);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function dbPut(key, value) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readwrite');
-    tx.objectStore(DB_STORE).put(value, key);
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-function guessContentType(url) {
-  if (url.endsWith('.json')) return 'application/json; charset=utf-8';
-  if (url.endsWith('.wasm')) return 'application/wasm';
-  return 'application/octet-stream';
-}
-
-// Overrides window.fetch to cache HuggingFace model files in IndexedDB.
-// Called before the first from_pretrained() so all model downloads go through here.
-function setupFetchOverride(onProgress) {
-  const _fetch = window.fetch.bind(window);
-  window.fetch = async function cachedFetch(input, init) {
-    const url = typeof input === 'string' ? input : input.url;
-    if (!HF_DOMAINS.some(d => url.includes(d))) return _fetch(input, init);
-
-    try {
-      const cached = await dbGet(url);
-      if (cached) {
-        return new Response(cached, {
-          status: 200,
-          headers: { 'content-type': guessContentType(url), 'content-length': String(cached.byteLength) },
-        });
-      }
-    } catch (_) { /* fall through */ }
-
-    const response = await _fetch(input, init);
-    if (!response.ok) return response;
-
-    const total = parseInt(response.headers.get('content-length') ?? '0', 10);
-    let loaded = 0;
-    const chunks = [];
-    const reader = response.body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loaded += value.length;
-      if (loaded % (256 * 1024) < value.length) onProgress({ loaded, total, url });
-    }
-
-    const combined = new Uint8Array(loaded);
-    let offset = 0;
-    for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.length; }
-
-    dbPut(url, combined.buffer).catch(e => console.warn('IndexedDB write failed:', e));
-    onProgress({ loaded, total, url });
-
-    return new Response(combined.buffer, {
-      status: 200,
-      headers: { 'content-type': guessContentType(url), 'content-length': String(loaded) },
-    });
-  };
-}
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-const MODEL_ID = 'HuggingFaceTB/SmolVLM-500M-Instruct';
-const CAPTURE_PX = 448;
-const FRAME_MS = 2500;
+const CAPTURE_PX = 256;
+const FRAME_MS = 2000;
 const MODES = ['navigation', 'traffic', 'scene', 'read'];
 const MODE_LABELS = { navigation: 'Navigation', traffic: 'Traffic Light', scene: 'Scene', read: 'Read Text' };
 const MODE_ICONS  = { navigation: '🚶', traffic: '🚦', scene: '🌍', read: '📝' };
-const PROMPTS = {
-  navigation: 'In one short sentence: is the path ahead clear, or are there obstacles? Name specific objects.',
-  traffic:    'In one short sentence: is a traffic light visible? If yes, what color is it?',
-  scene:      'In two sentences, describe the scene and surroundings.',
-  read:       'Read any visible text. If there is none, say: no text visible.',
-};
 
 function fmtBytes(b) {
   if (b < 1024 ** 2) return `${(b / 1024).toFixed(0)} KB`;
   return `${(b / 1024 ** 2).toFixed(1)} MB`;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
 export default function BlindAssistant({ onShowAbout }) {
   const [phase, setPhase]           = useState('initializing');
   const [mode, setMode]             = useState('navigation');
@@ -128,26 +19,24 @@ export default function BlindAssistant({ onShowAbout }) {
   const [downloaded, setDownloaded] = useState(0);
   const [errorMsg, setErrorMsg]     = useState('');
 
-  const modelRef     = useRef(null);
-  const processorRef = useRef(null);
+  const workerRef    = useRef(null);
   const videoRef     = useRef(null);
   const canvasRef    = useRef(null);
-  const runningRef   = useRef(false); // controls the analysis loop
-  const busyRef      = useRef(false); // true while inference is in progress
+  const runningRef   = useRef(false);
   const modeRef      = useRef(mode);
   const phaseRef     = useRef(phase);
   const lastTextRef  = useRef('');
   const downloadRef  = useRef(0);
+  const loopTimerRef = useRef(null);
 
-  // tap gesture tracking
-  const tapCountRef     = useRef(0);
-  const tapTimerRef     = useRef(null);
-  const longPressRef    = useRef(null);
+  const tapCountRef  = useRef(0);
+  const tapTimerRef  = useRef(null);
+  const longPressRef = useRef(null);
 
   useEffect(() => { modeRef.current = mode; },  [mode]);
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
-  // ── TTS ────────────────────────────────────────────────────────────────────
+  // ── TTS ──────────────────────────────────────────────────────────────────────
   const speak = useCallback((text, urgent = false) => {
     if (!text || !window.speechSynthesis) return;
     if (urgent) window.speechSynthesis.cancel();
@@ -156,58 +45,59 @@ export default function BlindAssistant({ onShowAbout }) {
     window.speechSynthesis.speak(utt);
   }, []);
 
-  // ── Model loading ──────────────────────────────────────────────────────────
+  // ── Worker setup ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (navigator.storage?.persist) navigator.storage.persist();
 
-    setupFetchOverride(({ loaded, total, url }) => {
-      // Only count each file's final chunk (avoid double-counting progress ticks)
-      if (!url || loaded !== total) return;
-      downloadRef.current += total;
-      setDownloaded(downloadRef.current);
-      setPhase(p => p === 'loading' || p === 'ready' || p === 'running' ? p : 'downloading');
-    });
+    // eslint-disable-next-line no-undef
+    const worker = new Worker(new URL('../workers/inferenceWorker.js', import.meta.url));
+    workerRef.current = worker;
 
-    (async () => {
-      try {
-        // Dynamic import works fine in the main thread — webpack uses <script> tags,
-        // not blob URLs, so MIME types are always correct.
-        const { AutoProcessor, AutoModelForVision2Seq, env } = await import('@huggingface/transformers');
-
-        // Serve ORT runtime files from public/ instead of CDN.
-        // Transformers.js sets wasmPaths to its own CDN by default, where the ORT
-        // files don't actually exist (they're a different package). Pointing to '/'
-        // uses the files we copied to public/ (ort-wasm-simd-threaded.*).
-        env.backends.onnx.wasm.wasmPaths = '/';
-        // numThreads=1 disables SharedArrayBuffer-based threading, so ORT never
-        // creates its thread-worker blob. Combined with the createObjectURL patch
-        // above, this eliminates all blob-URL-as-module-script failures.
-        env.backends.onnx.wasm.numThreads = 1;
-        env.backends.onnx.wasm.proxy = false;
-        env.useFSCache = false;
-
-        setPhase('loading');
-        setStatusMsg('Loading processor...');
-        processorRef.current = await AutoProcessor.from_pretrained(MODEL_ID);
-
-        setStatusMsg('Loading vision model (first run downloads ~300 MB)...');
-        modelRef.current = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, {
-          dtype: { embed_tokens: 'fp32', vision_encoder: 'q4', decoder_model_merged: 'q4' },
-        });
-
-        setPhase('ready');
-        speak('Model ready. Tap anywhere to begin.');
-      } catch (err) {
-        console.error('Model load error:', err);
-        setErrorMsg(err.message);
-        setPhase('error');
+    worker.onmessage = ({ data }) => {
+      switch (data.type) {
+        case 'status':
+          setStatusMsg(data.message);
+          setPhase(p => p === 'initializing' ? 'loading' : p);
+          break;
+        case 'downloadProgress': {
+          const { loaded, total } = data;
+          if (loaded !== total) break;
+          downloadRef.current += total;
+          setDownloaded(downloadRef.current);
+          setPhase(p => (p === 'loading' || p === 'ready' || p === 'running' || p === 'paused') ? p : 'downloading');
+          break;
+        }
+        case 'ready':
+          setPhase('ready');
+          speak('Model ready. Tap anywhere to begin.');
+          break;
+        case 'result': {
+          const { text } = data;
+          setLastText(text);
+          lastTextRef.current = text;
+          speak(text);
+          break;
+        }
+        case 'error':
+          setErrorMsg(data.message);
+          setPhase('error');
+          break;
+        default:
+          break;
       }
-    })();
+    };
 
-    return () => { runningRef.current = false; stopCamera(); };
+    worker.postMessage({ type: 'init' });
+
+    return () => {
+      runningRef.current = false;
+      clearTimeout(loopTimerRef.current);
+      stopCamera();
+      worker.terminate();
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Camera ─────────────────────────────────────────────────────────────────
+  // ── Camera ────────────────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -231,53 +121,41 @@ export default function BlindAssistant({ onShowAbout }) {
     if (v?.srcObject) { v.srcObject.getTracks().forEach(t => t.stop()); v.srcObject = null; }
   };
 
-  // ── Inference loop (main thread) ───────────────────────────────────────────
-  // speechSynthesis runs in a separate browser thread, so audio plays even
-  // while WASM inference occupies the main thread.
-  const runLoop = useCallback(async () => {
-    const { RawImage } = await import('@huggingface/transformers');
+  // ── Frame capture → worker ────────────────────────────────────────────────────
+  const captureAndSend = useCallback(() => {
+    const video  = videoRef.current;
+    const canvas = canvasRef.current;
+    const worker = workerRef.current;
+    if (!video || !canvas || !worker || video.readyState < 2) return;
 
-    while (runningRef.current) {
-      if (!busyRef.current && modelRef.current && processorRef.current) {
-        const video  = videoRef.current;
-        const canvas = canvasRef.current;
+    canvas.width  = CAPTURE_PX;
+    canvas.height = CAPTURE_PX;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, CAPTURE_PX, CAPTURE_PX);
+    const imageData = ctx.getImageData(0, 0, CAPTURE_PX, CAPTURE_PX);
 
-        if (video && canvas && video.readyState >= 2) {
-          busyRef.current = true;
-          try {
-            canvas.width  = CAPTURE_PX;
-            canvas.height = CAPTURE_PX;
-            canvas.getContext('2d').drawImage(video, 0, 0, CAPTURE_PX, CAPTURE_PX);
+    worker.postMessage(
+      { type: 'analyze', data: { imageBuffer: imageData.data.buffer, width: CAPTURE_PX, height: CAPTURE_PX, mode: modeRef.current } },
+      [imageData.data.buffer]
+    );
+  }, []);
 
-            const blob  = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
-            const image = await RawImage.fromBlob(blob);
-            const prompt = PROMPTS[modeRef.current] ?? PROMPTS.navigation;
+  // ── Analysis loop ─────────────────────────────────────────────────────────────
+  const startLoop = useCallback(() => {
+    const tick = () => {
+      if (!runningRef.current) return;
+      captureAndSend();
+      loopTimerRef.current = setTimeout(tick, FRAME_MS);
+    };
+    tick();
+  }, [captureAndSend]);
 
-            const messages = [{ role: 'user', content: [{ type: 'image' }, { type: 'text', text: prompt }] }];
-            const text   = processorRef.current.apply_chat_template(messages, { add_generation_prompt: true });
-            const inputs = await processorRef.current(text, [image], { do_image_splitting: false });
-            const generated = await modelRef.current.generate({ ...inputs, max_new_tokens: 40 });
-            const output = processorRef.current.batch_decode(
-              generated.slice(null, [inputs.input_ids.dims.at(-1), null]),
-              { skip_special_tokens: true }
-            );
-            const result = output[0].trim();
-            setLastText(result);
-            lastTextRef.current = result;
-            speak(result);
-          } catch (err) {
-            console.error('Inference error:', err);
-          } finally {
-            busyRef.current = false;
-          }
-        }
-      }
-      // Wait between frames regardless of whether inference ran
-      await new Promise(res => setTimeout(res, FRAME_MS));
-    }
-  }, [speak]);
+  const stopLoop = useCallback(() => {
+    runningRef.current = false;
+    clearTimeout(loopTimerRef.current);
+  }, []);
 
-  // ── Gesture handlers ───────────────────────────────────────────────────────
+  // ── Gesture handlers ──────────────────────────────────────────────────────────
   const cycleMode = useCallback(() => {
     const next = MODES[(MODES.indexOf(modeRef.current) + 1) % MODES.length];
     setMode(next);
@@ -292,19 +170,19 @@ export default function BlindAssistant({ onShowAbout }) {
         runningRef.current = true;
         setPhase('running');
         speak(`Starting. ${MODE_LABELS[modeRef.current]} mode.`);
-        runLoop();
+        startLoop();
       }).catch(() => {});
     } else if (p === 'running') {
-      runningRef.current = false;
+      stopLoop();
       setPhase('paused');
       speak('Paused.');
     } else if (p === 'paused') {
       runningRef.current = true;
       setPhase('running');
       speak('Resumed.');
-      runLoop();
+      startLoop();
     }
-  }, [startCamera, runLoop, speak]);
+  }, [startCamera, startLoop, stopLoop, speak]);
 
   const handleDoubleTap = useCallback(() => {
     if (lastTextRef.current) speak(lastTextRef.current, true);
@@ -340,7 +218,7 @@ export default function BlindAssistant({ onShowAbout }) {
     longPressRef.current = null;
   }, []);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <div
       style={{ position: 'relative', width: '100vw', height: '100vh', background: '#000', overflow: 'hidden', userSelect: 'none', touchAction: 'none' }}
@@ -368,7 +246,7 @@ export default function BlindAssistant({ onShowAbout }) {
             </h2>
             {downloaded > 0 && (
               <p style={{ margin: '0 0 4px', color: '#555', fontSize: 14 }}>
-                {fmtBytes(downloaded)} saved to IndexedDB
+                {fmtBytes(downloaded)} saved to device
               </p>
             )}
             <p style={{ margin: '4px 0 0', color: '#888', fontSize: 13 }}>{statusMsg}</p>
@@ -438,7 +316,7 @@ export default function BlindAssistant({ onShowAbout }) {
             : <p style={{ ...S.descText, color: '#aaa', fontStyle: 'italic' }}>Analyzing...</p>
           }
           <p style={S.hint}>Tap · Double-tap to repeat · Long press to change mode</p>
-          <p style={S.privacy}>🔒 On-device · IndexedDB · Zero data sent</p>
+          <p style={S.privacy}>🔒 On-device · Zero data sent</p>
         </div>
       )}
     </div>
